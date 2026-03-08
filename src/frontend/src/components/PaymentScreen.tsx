@@ -1,7 +1,7 @@
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { useChatterStore } from "@/hooks/useChatterStore";
+import { addStoredBalance, getStoredSession } from "@/hooks/useChatterStore";
 import { ArrowLeft, CreditCard, Loader2, Lock } from "lucide-react";
 import { motion } from "motion/react";
 import { useState } from "react";
@@ -14,7 +14,6 @@ interface PaymentScreenProps {
 }
 
 export function PaymentScreen({ onNavigate }: PaymentScreenProps) {
-  const { addBalance } = useChatterStore();
   const [cardNumber, setCardNumber] = useState("");
   const [expiry, setExpiry] = useState("");
   const [cvv, setCvv] = useState("");
@@ -38,7 +37,10 @@ export function PaymentScreen({ onNavigate }: PaymentScreenProps) {
     setPaying(true);
     // Simulate payment processing
     await new Promise((r) => setTimeout(r, 1800));
-    addBalance(100);
+    const session = getStoredSession();
+    if (session?.username) {
+      addStoredBalance(session.username, 100);
+    }
     toast.success("Payment successful! ₹100 added to your account 🎉");
     setPaying(false);
     onNavigate("home");

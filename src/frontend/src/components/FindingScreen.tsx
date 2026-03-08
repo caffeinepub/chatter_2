@@ -1,142 +1,176 @@
 import { Button } from "@/components/ui/button";
-import { useChatterStore } from "@/hooks/useChatterStore";
+import { useActor } from "@/hooks/useActor";
+import {
+  type Gender,
+  getStoredSession,
+  parseProfile,
+  useChatterStore,
+} from "@/hooks/useChatterStore";
 import { ArrowLeft } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { toast } from "sonner";
 
 type Screen = "auth" | "home" | "recharge" | "payment" | "finding" | "chat";
 
 interface FindingScreenProps {
   onNavigate: (screen: Screen) => void;
-  onMatchFound: (partnerUsername: string, chatKeyStr: string) => void;
+  onMatchFound: (
+    partnerDisplayName: string,
+    partnerPrincipalText: string,
+  ) => void;
+  targetGender: Gender;
 }
+
+const TIMEOUT_SECS = 59;
+const POLL_INTERVAL = 2500;
 
 export function FindingScreen({
   onNavigate,
   onMatchFound,
+  targetGender,
 }: FindingScreenProps) {
   const {
-    currentUser,
-    setOnline,
-    setOffline,
-    findMatch,
-    getActiveChat,
-    chatKey,
+    setSeekingStatus,
+    clearSeekingStatus,
+    findPotentialMatch,
+    acceptMatch,
+    pollForMatch,
   } = useChatterStore();
+  const { actor } = useActor();
+
   const [elapsed, setElapsed] = useState(0);
   const [status, setStatus] = useState<"searching" | "timeout">("searching");
+  const [phase, setPhase] = useState<"seeking" | "accepting" | "waiting">(
+    "seeking",
+  );
+
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const startTimeRef = useRef(Date.now());
+  const matchedRef = useRef(false);
+  const cleanedUpRef = useRef(false);
 
-  useEffect(() => {
-    if (!currentUser) return;
+  const session = getStoredSession();
+  const myDisplayName = session?.username ?? "";
 
-    // Register self as online
-    setOnline();
+  const cleanup = useCallback(
+    async (clearStatus = true) => {
+      if (cleanedUpRef.current) return;
+      cleanedUpRef.current = true;
+      if (timerRef.current) clearInterval(timerRef.current);
+      if (pollRef.current) clearInterval(pollRef.current);
+      if (clearStatus) {
+        await clearSeekingStatus();
+      }
+    },
+    [clearSeekingStatus],
+  );
 
-    // Heartbeat to keep presence fresh
-    const heartbeat = setInterval(() => {
-      setOnline();
-    }, 5000);
+  const startSearch = useCallback(async () => {
+    if (!actor || !myDisplayName) return;
+    cleanedUpRef.current = false;
+    matchedRef.current = false;
+
+    // Register ourselves as seeking
+    setPhase("seeking");
+    await setSeekingStatus(targetGender);
 
     // Elapsed timer
     timerRef.current = setInterval(() => {
       const secs = Math.floor((Date.now() - startTimeRef.current) / 1000);
       setElapsed(secs);
-      if (secs >= 30) {
+      if (secs >= TIMEOUT_SECS) {
         setStatus("timeout");
-        clearInterval(timerRef.current!);
-        clearInterval(pollRef.current!);
-        clearInterval(heartbeat);
-        setOffline();
+        cleanup(true);
       }
     }, 1000);
 
-    // Poll for match every 2 seconds
-    pollRef.current = setInterval(() => {
-      // First check if someone else already created a session with us
-      const existingChat = getActiveChat();
-      if (existingChat) {
-        cleanup(heartbeat);
-        onMatchFound(existingChat.partner, existingChat.key);
-        return;
+    // Poll for match
+    pollRef.current = setInterval(async () => {
+      if (matchedRef.current) return;
+
+      try {
+        // First: check if someone already matched with us (they responded to our SEEKING)
+        const incomingMatch = await pollForMatch(myDisplayName);
+        if (incomingMatch && !matchedRef.current) {
+          matchedRef.current = true;
+          setPhase("accepting");
+          await cleanup(false); // Don't clear our profile yet — chat will clear it
+          // Navigate to chat
+          onMatchFound(
+            incomingMatch.partner.displayName,
+            incomingMatch.partner.principalText,
+          );
+          return;
+        }
+
+        // Second: look for a seeking user we can match with
+        const candidate = await findPotentialMatch(targetGender, myDisplayName);
+        if (candidate && !matchedRef.current) {
+          matchedRef.current = true;
+          setPhase("accepting");
+          // Accept the match — update our profile to MATCHED
+          const { ok } = await acceptMatch(candidate);
+          if (!ok) {
+            matchedRef.current = false;
+            setPhase("seeking");
+            return;
+          }
+          await cleanup(false);
+          onMatchFound(candidate.displayName, candidate.principalText);
+        }
+      } catch (err) {
+        console.error("Matching error:", err);
       }
-
-      // Try to create a match
-      const partner = findMatch();
-      if (partner) {
-        const key = chatKey(currentUser.username, partner);
-        cleanup(heartbeat);
-        onMatchFound(partner, key);
-      }
-    }, 2000);
-
-    function cleanup(hb: ReturnType<typeof setInterval>) {
-      clearInterval(timerRef.current!);
-      clearInterval(pollRef.current!);
-      clearInterval(hb);
-    }
-
-    return () => {
-      clearInterval(timerRef.current!);
-      clearInterval(pollRef.current!);
-      clearInterval(heartbeat);
-      setOffline();
-    };
+    }, POLL_INTERVAL);
   }, [
-    currentUser,
-    setOnline,
-    setOffline,
-    findMatch,
-    getActiveChat,
-    chatKey,
+    actor,
+    myDisplayName,
+    targetGender,
+    setSeekingStatus,
+    findPotentialMatch,
+    acceptMatch,
+    pollForMatch,
+    cleanup,
     onMatchFound,
   ]);
 
-  const handleCancel = () => {
-    setOffline();
+  // biome-ignore lint/correctness/useExhaustiveDependencies: startSearch is memoized
+  useEffect(() => {
+    if (!actor) return;
+    startSearch();
+    return () => {
+      if (!matchedRef.current) {
+        cleanup(true);
+      }
+    };
+  }, [actor]);
+
+  const handleCancel = async () => {
+    await cleanup(true);
     onNavigate("home");
   };
 
-  const handleTryAgain = () => {
+  const handleTryAgain = async () => {
     setStatus("searching");
     setElapsed(0);
     startTimeRef.current = Date.now();
-    setOnline();
-
-    // Restart timers
-    timerRef.current = setInterval(() => {
-      const secs = Math.floor((Date.now() - startTimeRef.current) / 1000);
-      setElapsed(secs);
-      if (secs >= 30) {
-        setStatus("timeout");
-        clearInterval(timerRef.current!);
-        clearInterval(pollRef.current!);
-        setOffline();
-      }
-    }, 1000);
-
-    pollRef.current = setInterval(() => {
-      if (!currentUser) return;
-      const existingChat = getActiveChat();
-      if (existingChat) {
-        clearInterval(timerRef.current!);
-        clearInterval(pollRef.current!);
-        onMatchFound(existingChat.partner, existingChat.key);
-        return;
-      }
-      const partner = findMatch();
-      if (partner) {
-        const key = chatKey(currentUser.username, partner);
-        clearInterval(timerRef.current!);
-        clearInterval(pollRef.current!);
-        onMatchFound(partner, key);
-      }
-    }, 2000);
+    cleanedUpRef.current = false;
+    matchedRef.current = false;
+    await startSearch();
   };
 
-  const targetGender = currentUser?.gender === "male" ? "female" : "male";
+  const genderLabel = targetGender === "male" ? "male" : "female";
+  const genderColor =
+    targetGender === "male" ? "oklch(0.65 0.18 230)" : "oklch(0.72 0.18 350)";
+
+  const phaseText =
+    phase === "accepting"
+      ? "Match found! Connecting..."
+      : phase === "waiting"
+        ? "Waiting for partner..."
+        : `Looking for ${genderLabel} users online`;
 
   return (
     <div className="min-h-screen flex flex-col items-center justify-center relative overflow-hidden px-6">
@@ -179,7 +213,9 @@ export function FindingScreen({
                   key={i}
                   className="absolute rounded-full border"
                   style={{
-                    borderColor: "oklch(0.62 0.18 210 / 0.4)",
+                    borderColor: genderColor
+                      .replace(")", " / 0.4)")
+                      .replace("oklch(", "oklch("),
                     width: `${80 + i * 50}px`,
                     height: `${80 + i * 50}px`,
                   }}
@@ -195,12 +231,13 @@ export function FindingScreen({
               <div
                 className="h-16 w-16 rounded-full flex items-center justify-center z-10 relative"
                 style={{
-                  background:
-                    "linear-gradient(135deg, oklch(0.62 0.18 210), oklch(0.52 0.22 280))",
-                  boxShadow: "0 0 32px oklch(0.62 0.18 210 / 0.5)",
+                  background: `linear-gradient(135deg, ${genderColor}, oklch(0.52 0.22 280))`,
+                  boxShadow: `0 0 32px ${genderColor.replace(")", " / 0.5)").replace("oklch(", "oklch(")}`,
                 }}
               >
-                <span className="text-2xl">🔍</span>
+                <span className="text-2xl">
+                  {targetGender === "male" ? "♂" : "♀"}
+                </span>
               </div>
             </div>
 
@@ -209,13 +246,12 @@ export function FindingScreen({
                 className="font-display font-bold text-2xl"
                 style={{ color: "oklch(0.95 0.01 255)" }}
               >
-                Finding your match...
+                {phase === "accepting"
+                  ? "Match found!"
+                  : "Finding your match..."}
               </h2>
-              <p
-                className="text-sm mt-2"
-                style={{ color: "oklch(0.6 0.06 220)" }}
-              >
-                Looking for {targetGender} users online
+              <p className="text-sm mt-2" style={{ color: genderColor }}>
+                {phaseText}
               </p>
             </div>
 
@@ -225,7 +261,7 @@ export function FindingScreen({
                 <motion.div
                   key={i}
                   className="h-2.5 w-2.5 rounded-full"
-                  style={{ background: "oklch(0.62 0.18 210)" }}
+                  style={{ background: genderColor }}
                   animate={{ opacity: [0.3, 1, 0.3], y: [0, -6, 0] }}
                   transition={{
                     duration: 1,
@@ -240,7 +276,8 @@ export function FindingScreen({
               className="text-xs tabular-nums"
               style={{ color: "oklch(0.5 0.04 255)" }}
             >
-              {elapsed}s elapsed · Times out in {30 - elapsed}s
+              {elapsed}s elapsed · Times out in{" "}
+              {Math.max(0, TIMEOUT_SECS - elapsed)}s
             </p>
 
             <Button
@@ -279,7 +316,7 @@ export function FindingScreen({
                 className="text-sm mt-2"
                 style={{ color: "oklch(0.6 0.04 255)" }}
               >
-                There are no {targetGender} users online. Try again in a moment!
+                No {genderLabel} users are online. Try again in a moment!
               </p>
             </div>
             <div className="flex flex-col gap-3 w-full">
@@ -288,8 +325,7 @@ export function FindingScreen({
                 onClick={handleTryAgain}
                 className="w-full font-semibold btn-glow"
                 style={{
-                  background:
-                    "linear-gradient(135deg, oklch(0.62 0.18 210), oklch(0.52 0.22 280))",
+                  background: `linear-gradient(135deg, ${genderColor}, oklch(0.52 0.22 280))`,
                   color: "white",
                   border: "none",
                 }}

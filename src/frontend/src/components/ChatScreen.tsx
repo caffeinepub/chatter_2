@@ -1,15 +1,13 @@
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import {
-  type ChatMessage,
-  type ChatSession,
-  useChatterStore,
-} from "@/hooks/useChatterStore";
+import { useChatterStore } from "@/hooks/useChatterStore";
+import { useInternetIdentity } from "@/hooks/useInternetIdentity";
 import { Image, Loader2, Mic, PhoneOff, Send, Smile, X } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
+import type { Message } from "../backend.d";
 import { AudioMessage } from "./AudioMessage";
 import { EmojiStickerPicker, getStickerContent } from "./EmojiStickerPicker";
 import { UserAvatar } from "./UserAvatar";
@@ -17,16 +15,107 @@ import { UserAvatar } from "./UserAvatar";
 type Screen = "auth" | "home" | "recharge" | "payment" | "finding" | "chat";
 
 interface ChatScreenProps {
-  partnerUsername: string;
-  chatKeyStr: string;
+  partnerDisplayName: string;
+  partnerPrincipalText: string;
   onNavigate: (screen: Screen) => void;
 }
 
-function formatTime(ts: number): string {
-  return new Date(ts).toLocaleTimeString([], {
+function formatTime(ns: bigint): string {
+  const ms = Number(ns) / 1_000_000;
+  return new Date(ms).toLocaleTimeString([], {
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+type MsgRenderType =
+  | "text"
+  | "image"
+  | "audio"
+  | "emoji"
+  | "sticker"
+  | "system";
+
+interface ParsedMessage {
+  id: string;
+  senderPrincipal: string;
+  type: MsgRenderType;
+  content: string;
+  timestamp: bigint;
+}
+
+function parseBackendMessage(msg: Message): ParsedMessage {
+  const id = `${msg.timestamp}_${msg.sender.toText().slice(-6)}`;
+  const senderPrincipal = msg.sender.toText();
+  const ts = msg.timestamp;
+
+  if (msg.content.__kind__ === "audio") {
+    // Convert Uint8Array to base64
+    let binary = "";
+    const bytes = msg.content.audio;
+    for (let i = 0; i < bytes.length; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    const b64 = btoa(binary);
+    return {
+      id,
+      senderPrincipal,
+      type: "audio",
+      content: `data:audio/webm;base64,${b64}`,
+      timestamp: ts,
+    };
+  }
+
+  const text = msg.content.text;
+
+  if (text.startsWith("__IMAGE__:")) {
+    return {
+      id,
+      senderPrincipal,
+      type: "image",
+      content: text.slice("__IMAGE__:".length),
+      timestamp: ts,
+    };
+  }
+  if (text.startsWith("__VOICE__:")) {
+    const b64 = text.slice("__VOICE__:".length);
+    return {
+      id,
+      senderPrincipal,
+      type: "audio",
+      content: `data:audio/webm;base64,${b64}`,
+      timestamp: ts,
+    };
+  }
+  if (text.startsWith("__SYSTEM__:")) {
+    return {
+      id,
+      senderPrincipal,
+      type: "system",
+      content: text.slice("__SYSTEM__:".length),
+      timestamp: ts,
+    };
+  }
+  if (text.startsWith("__EMOJI__:")) {
+    return {
+      id,
+      senderPrincipal,
+      type: "emoji",
+      content: text.slice("__EMOJI__:".length),
+      timestamp: ts,
+    };
+  }
+  if (text.startsWith("__STICKER__:")) {
+    return {
+      id,
+      senderPrincipal,
+      type: "sticker",
+      content: text.slice("__STICKER__:".length),
+      timestamp: ts,
+    };
+  }
+
+  return { id, senderPrincipal, type: "text", content: text, timestamp: ts };
 }
 
 function MessageBubble({
@@ -34,7 +123,7 @@ function MessageBubble({
   isSent,
   index,
 }: {
-  msg: ChatMessage;
+  msg: ParsedMessage;
   isSent: boolean;
   index: number;
 }) {
@@ -67,7 +156,6 @@ function MessageBubble({
           />
         );
       case "audio": {
-        // Convert dataURL back to Uint8Array
         const base64 = msg.content.split(",")[1] ?? msg.content;
         const binary = atob(base64);
         const bytes = new Uint8Array(binary.length);
@@ -76,10 +164,14 @@ function MessageBubble({
         }
         return <AudioMessage audio={bytes} isSent={isSent} />;
       }
+      case "system":
+        return null; // system messages are handled separately
       default:
         return <p className="text-sm">{msg.content}</p>;
     }
   };
+
+  if (msg.type === "system") return null;
 
   return (
     <motion.div
@@ -118,64 +210,82 @@ function MessageBubble({
 }
 
 export function ChatScreen({
-  partnerUsername,
-  chatKeyStr,
+  partnerDisplayName,
+  partnerPrincipalText,
   onNavigate,
 }: ChatScreenProps) {
   const {
-    currentUsername,
-    sendMessage,
-    getMessages,
-    getChatSession,
-    requestDisconnect,
-    approveDisconnect,
-    cleanupDisconnectedChat,
-    setOffline,
+    sendChatMessage,
+    sendImageMessage,
+    sendVoiceMessage,
+    sendSystemMessage,
+    getChatMessages,
+    clearSeekingStatus,
   } = useChatterStore();
 
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [session, setSession] = useState<ChatSession | null>(null);
+  const { identity } = useInternetIdentity();
+  const myPrincipalText = identity?.getPrincipal().toText() ?? "";
+
+  const [messages, setMessages] = useState<ParsedMessage[]>([]);
   const [text, setText] = useState("");
   const [showPicker, setShowPicker] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [isSendingVoice, setIsSendingVoice] = useState(false);
+  const [isSendingMsg, setIsSendingMsg] = useState(false);
   const [disconnectPending, setDisconnectPending] = useState(false);
+  const [partnerDisconnectRequest, setPartnerDisconnectRequest] =
+    useState(false);
+  const [chatEnded, setChatEnded] = useState(false);
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const streamRef = useRef<MediaStream | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const lastMsgCountRef = useRef(0);
 
-  // Poll for new messages and session state every 1.5s
+  // Clear seeking status from backend profile on mount
   useEffect(() => {
-    const refresh = () => {
-      const msgs = getMessages(chatKeyStr);
-      setMessages([...msgs]);
-      const sess = getChatSession(chatKeyStr);
-      setSession(sess);
+    clearSeekingStatus().catch(() => {});
+  }, [clearSeekingStatus]);
 
-      // Both users requested disconnect => auto-complete
-      if (sess && sess.disconnectRequests.length >= 2) {
-        clearInterval(pollRef.current!);
-        cleanupDisconnectedChat(chatKeyStr);
-        setOffline();
-        toast.success("Chat disconnected. You can start a new one!");
-        onNavigate("home");
+  // Poll for new messages every 2s
+  useEffect(() => {
+    const refresh = async () => {
+      const backendMsgs = await getChatMessages(partnerPrincipalText);
+      const parsed = backendMsgs.map(parseBackendMessage);
+
+      // Check for system messages
+      for (const m of parsed) {
+        if (m.type === "system" && m.senderPrincipal !== myPrincipalText) {
+          if (m.content === "DISCONNECT_REQUEST") {
+            setPartnerDisconnectRequest(true);
+          } else if (
+            m.content === "DISCONNECT_APPROVED" ||
+            m.content === "DISCONNECT_COMPLETE"
+          ) {
+            setChatEnded(true);
+          } else if (m.content === "DISCONNECT_DENIED") {
+            setDisconnectPending(false);
+            toast.info("Disconnect request denied. Continue chatting!");
+          }
+        }
+      }
+
+      // Filter out system messages for display
+      const displayMsgs = parsed.filter((m) => m.type !== "system");
+      setMessages(displayMsgs);
+
+      if (displayMsgs.length > lastMsgCountRef.current) {
+        lastMsgCountRef.current = displayMsgs.length;
       }
     };
 
     refresh();
-    pollRef.current = setInterval(refresh, 1500);
+    pollRef.current = setInterval(refresh, 2000);
     return () => clearInterval(pollRef.current!);
-  }, [
-    chatKeyStr,
-    getMessages,
-    getChatSession,
-    cleanupDisconnectedChat,
-    setOffline,
-    onNavigate,
-  ]);
+  }, [partnerPrincipalText, getChatMessages, myPrincipalText]);
 
   // Auto-scroll
   // biome-ignore lint/correctness/useExhaustiveDependencies: intentional — scroll when message count changes
@@ -183,49 +293,60 @@ export function ChatScreen({
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages.length]);
 
-  const partnerRequestedDisconnect =
-    session?.disconnectRequests.includes(partnerUsername) &&
-    !session.disconnectRequests.includes(currentUsername ?? "");
+  // Handle chat ended
+  useEffect(() => {
+    if (chatEnded) {
+      clearInterval(pollRef.current!);
+      toast.success("Chat disconnected. You can start a new one!");
+      onNavigate("home");
+    }
+  }, [chatEnded, onNavigate]);
 
-  const iRequestedDisconnect =
-    session?.disconnectRequests.includes(currentUsername ?? "") ?? false;
-
-  const handleSendText = (e: React.FormEvent) => {
+  const handleSendText = async (e: React.FormEvent) => {
     e.preventDefault();
     const trimmed = text.trim();
-    if (!trimmed || !currentUsername) return;
+    if (!trimmed || isSendingMsg) return;
     setText("");
-    sendMessage(chatKeyStr, {
-      senderUsername: currentUsername,
-      type: "text",
-      content: trimmed,
-    });
+    setIsSendingMsg(true);
+    try {
+      await sendChatMessage(partnerPrincipalText, trimmed);
+    } catch {
+      toast.error("Failed to send message");
+    } finally {
+      setIsSendingMsg(false);
+    }
   };
 
-  const handleEmojiSticker = (type: "emoji" | "sticker", content: string) => {
-    if (!currentUsername) return;
+  const handleEmojiSticker = async (
+    type: "emoji" | "sticker",
+    content: string,
+  ) => {
     setShowPicker(false);
-    sendMessage(chatKeyStr, { senderUsername: currentUsername, type, content });
+    try {
+      const prefix = type === "emoji" ? "__EMOJI__:" : "__STICKER__:";
+      await sendChatMessage(partnerPrincipalText, `${prefix}${content}`);
+    } catch {
+      toast.error("Failed to send");
+    }
   };
 
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file || !currentUsername) return;
-    if (file.size > 2 * 1024 * 1024) {
-      toast.error("Image must be under 2MB");
+    if (!file) return;
+    if (file.size > 1.5 * 1024 * 1024) {
+      toast.error("Image must be under 1.5MB for chat transmission");
       return;
     }
     const reader = new FileReader();
-    reader.onload = (ev) => {
+    reader.onload = async (ev) => {
       const dataUrl = ev.target?.result as string;
-      sendMessage(chatKeyStr, {
-        senderUsername: currentUsername,
-        type: "image",
-        content: dataUrl,
-      });
+      try {
+        await sendImageMessage(partnerPrincipalText, dataUrl);
+      } catch {
+        toast.error("Failed to send image");
+      }
     };
     reader.readAsDataURL(file);
-    // Reset file input
     e.target.value = "";
   };
 
@@ -260,41 +381,58 @@ export function ChatScreen({
       const arrayBuffer = await blob.arrayBuffer();
       const uint8 = new Uint8Array(arrayBuffer);
 
-      // Stop tracks
       for (const t of streamRef.current?.getTracks() ?? []) t.stop();
       streamRef.current = null;
 
-      if (uint8.length === 0 || !currentUsername) {
+      if (uint8.length === 0) {
         setIsSendingVoice(false);
         return;
       }
 
-      // Convert to base64 dataURL
+      // Convert to base64
       let binary = "";
       for (let i = 0; i < uint8.length; i++) {
         binary += String.fromCharCode(uint8[i]);
       }
-      const dataUrl = `data:audio/webm;base64,${btoa(binary)}`;
-      sendMessage(chatKeyStr, {
-        senderUsername: currentUsername,
-        type: "audio",
-        content: dataUrl,
-      });
+      const b64 = btoa(binary);
+
+      try {
+        await sendVoiceMessage(partnerPrincipalText, b64);
+      } catch {
+        toast.error("Failed to send voice message");
+      }
       setIsSendingVoice(false);
     };
     recorder.stop();
-  }, [currentUsername, chatKeyStr, sendMessage]);
+  }, [partnerPrincipalText, sendVoiceMessage]);
 
-  const handleDisconnectRequest = () => {
-    if (!currentUsername) return;
-    requestDisconnect(chatKeyStr);
+  const handleDisconnectRequest = async () => {
     setDisconnectPending(true);
     toast.info("Disconnect request sent. Waiting for partner's approval...");
+    try {
+      await sendSystemMessage(partnerPrincipalText, "DISCONNECT_REQUEST");
+    } catch {
+      toast.error("Failed to send disconnect request");
+      setDisconnectPending(false);
+    }
   };
 
-  const handleApproveDisconnect = () => {
-    if (!currentUsername) return;
-    approveDisconnect(chatKeyStr);
+  const handleApproveDisconnect = async () => {
+    try {
+      await sendSystemMessage(partnerPrincipalText, "DISCONNECT_APPROVED");
+      setChatEnded(true);
+    } catch {
+      toast.error("Failed to approve disconnect");
+    }
+  };
+
+  const handleDenyDisconnect = async () => {
+    setPartnerDisconnectRequest(false);
+    try {
+      await sendSystemMessage(partnerPrincipalText, "DISCONNECT_DENIED");
+    } catch {
+      // best effort
+    }
   };
 
   return (
@@ -308,13 +446,13 @@ export function ChatScreen({
           borderColor: "oklch(0.28 0.025 255)",
         }}
       >
-        <UserAvatar username={partnerUsername} size="md" />
+        <UserAvatar username={partnerDisplayName} size="md" />
         <div className="flex-1 min-w-0">
           <p
             className="font-display font-bold truncate"
             style={{ color: "oklch(0.95 0.01 255)" }}
           >
-            {partnerUsername}
+            {partnerDisplayName}
           </p>
           <p className="text-xs" style={{ color: "oklch(0.55 0.06 180)" }}>
             ● Online
@@ -322,7 +460,7 @@ export function ChatScreen({
         </div>
 
         {/* Disconnect button */}
-        {!iRequestedDisconnect && !disconnectPending ? (
+        {!disconnectPending ? (
           <Button
             data-ocid="chat.delete_button"
             variant="ghost"
@@ -348,9 +486,9 @@ export function ChatScreen({
         )}
       </div>
 
-      {/* Disconnect request banner (partner asked) */}
+      {/* Disconnect approval banner */}
       <AnimatePresence>
-        {partnerRequestedDisconnect && (
+        {partnerDisconnectRequest && !disconnectPending && (
           <motion.div
             initial={{ opacity: 0, height: 0 }}
             animate={{ opacity: 1, height: "auto" }}
@@ -366,21 +504,32 @@ export function ChatScreen({
               className="text-sm font-medium"
               style={{ color: "oklch(0.88 0.1 25)" }}
             >
-              <strong>{partnerUsername}</strong> wants to disconnect
+              <strong>{partnerDisplayName}</strong> wants to disconnect
             </p>
-            <Button
-              data-ocid="chat.confirm_button"
-              size="sm"
-              onClick={handleApproveDisconnect}
-              className="h-7 text-xs font-semibold shrink-0"
-              style={{
-                background: "oklch(0.62 0.22 25)",
-                color: "white",
-                border: "none",
-              }}
-            >
-              Accept
-            </Button>
+            <div className="flex gap-2">
+              <Button
+                data-ocid="chat.confirm_button"
+                size="sm"
+                onClick={handleApproveDisconnect}
+                className="h-7 text-xs font-semibold shrink-0"
+                style={{
+                  background: "oklch(0.62 0.22 25)",
+                  color: "white",
+                  border: "none",
+                }}
+              >
+                Accept
+              </Button>
+              <Button
+                data-ocid="chat.cancel_button"
+                size="sm"
+                variant="ghost"
+                onClick={handleDenyDisconnect}
+                className="h-7 text-xs font-semibold shrink-0"
+              >
+                Deny
+              </Button>
+            </div>
           </motion.div>
         )}
       </AnimatePresence>
@@ -411,7 +560,7 @@ export function ChatScreen({
                 className="text-xs mt-1"
                 style={{ color: "oklch(0.5 0.03 255)" }}
               >
-                Say hello to {partnerUsername}
+                Say hello to {partnerDisplayName}
               </p>
             </motion.div>
           ) : (
@@ -420,7 +569,7 @@ export function ChatScreen({
                 <MessageBubble
                   key={msg.id}
                   msg={msg}
-                  isSent={msg.senderUsername === currentUsername}
+                  isSent={msg.senderPrincipal === myPrincipalText}
                   index={i + 1}
                 />
               ))}
@@ -532,7 +681,7 @@ export function ChatScreen({
             data-ocid="chat.input"
             value={text}
             onChange={(e) => setText(e.target.value)}
-            placeholder={`Message ${partnerUsername}…`}
+            placeholder={`Message ${partnerDisplayName}…`}
             className="flex-1 h-9 text-sm bg-input/50 border-border/60"
             style={{ color: "oklch(var(--foreground))" }}
           />
@@ -543,6 +692,7 @@ export function ChatScreen({
               type="submit"
               data-ocid="chat.primary_button"
               size="icon"
+              disabled={isSendingMsg}
               className="h-9 w-9 rounded-full btn-glow shrink-0"
               style={{
                 background: "oklch(0.62 0.18 210)",
@@ -550,7 +700,11 @@ export function ChatScreen({
                 border: "none",
               }}
             >
-              <Send className="h-4 w-4" />
+              {isSendingMsg ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <Send className="h-4 w-4" />
+              )}
             </Button>
           ) : (
             <Button

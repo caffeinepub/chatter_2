@@ -9,10 +9,12 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { useActor } from "@/hooks/useActor";
 import { type Gender, useChatterStore } from "@/hooks/useChatterStore";
-import { Loader2, MessageCircleHeart } from "lucide-react";
+import { useInternetIdentity } from "@/hooks/useInternetIdentity";
+import { Loader2, MessageCircleHeart, ShieldCheck } from "lucide-react";
 import { motion } from "motion/react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { toast } from "sonner";
 
 interface AuthScreenProps {
@@ -20,14 +22,21 @@ interface AuthScreenProps {
 }
 
 export function AuthScreen({ onSuccess }: AuthScreenProps) {
-  const { register, login } = useChatterStore();
+  const { setupProfile, login } = useChatterStore();
+  const {
+    identity,
+    login: iiLogin,
+    isInitializing,
+    isLoggingIn,
+    loginStatus,
+  } = useInternetIdentity();
+  const { actor, isFetching: actorFetching } = useActor();
 
   // Register form state
   const [regUsername, setRegUsername] = useState("");
   const [regPassword, setRegPassword] = useState("");
   const [regGender, setRegGender] = useState<Gender | "">("");
   const [regAge, setRegAge] = useState("");
-  const [regHeight, setRegHeight] = useState("");
   const [regCity, setRegCity] = useState("");
   const [regOccupation, setRegOccupation] = useState("");
   const [regError, setRegError] = useState("");
@@ -39,6 +48,28 @@ export function AuthScreen({ onSuccess }: AuthScreenProps) {
   const [loginError, setLoginError] = useState("");
   const [loginLoading, setLoginLoading] = useState(false);
 
+  // Auto-trigger II login when page loads if not already authenticated
+  const [iiRequested, setIiRequested] = useState(false);
+
+  useEffect(() => {
+    if (
+      !isInitializing &&
+      !identity &&
+      !iiRequested &&
+      loginStatus === "idle"
+    ) {
+      setIiRequested(true);
+      iiLogin();
+    }
+  }, [isInitializing, identity, iiRequested, loginStatus, iiLogin]);
+
+  const isReady = !!identity && !!actor && !actorFetching;
+  const showSpinner =
+    isInitializing ||
+    isLoggingIn ||
+    actorFetching ||
+    (!!identity && actorFetching);
+
   const handleRegister = async (e: React.FormEvent) => {
     e.preventDefault();
     setRegError("");
@@ -46,32 +77,37 @@ export function AuthScreen({ onSuccess }: AuthScreenProps) {
       setRegError("Please select your gender.");
       return;
     }
+    if (!isReady) {
+      setRegError("Still connecting to network. Please wait a moment.");
+      return;
+    }
     setRegLoading(true);
-    await new Promise((r) => setTimeout(r, 300));
-    const result = register({
-      username: regUsername,
-      password: regPassword,
-      gender: regGender as Gender,
-      age: Number.parseInt(regAge, 10),
-      height: Number.parseInt(regHeight, 10),
-      city: regCity,
-      occupation: regOccupation,
-    });
+    const result = await setupProfile(
+      regUsername,
+      regGender as Gender,
+      Number.parseInt(regAge, 10),
+      regCity,
+      regOccupation,
+      regPassword,
+    );
     setRegLoading(false);
     if (!result.ok) {
       setRegError(result.error ?? "Registration failed.");
       return;
     }
-    toast.success("Account created! Welcome to Chatter 💬");
+    toast.success("Account created! Welcome to TalkZy 💬");
     onSuccess();
   };
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoginError("");
+    if (!isReady) {
+      setLoginError("Still connecting to network. Please wait a moment.");
+      return;
+    }
     setLoginLoading(true);
-    await new Promise((r) => setTimeout(r, 300));
-    const result = login(loginUsername, loginPassword);
+    const result = await login(loginUsername, loginPassword);
     setLoginLoading(false);
     if (!result.ok) {
       setLoginError(result.error ?? "Login failed.");
@@ -121,12 +157,57 @@ export function AuthScreen({ onSuccess }: AuthScreenProps) {
             className="text-3xl font-bold tracking-tight font-display"
             style={{ color: "oklch(0.95 0.01 255)" }}
           >
-            Chatter
+            TalkZy
           </h1>
           <p className="text-sm mt-1" style={{ color: "oklch(0.6 0.04 255)" }}>
             Meet new people, have real conversations
           </p>
         </div>
+
+        {/* Network status indicator */}
+        {showSpinner && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            className="flex items-center justify-center gap-2 mb-4"
+          >
+            <Loader2
+              className="h-4 w-4 animate-spin"
+              style={{ color: "oklch(0.72 0.15 195)" }}
+            />
+            <span className="text-xs" style={{ color: "oklch(0.6 0.04 255)" }}>
+              {isInitializing || isLoggingIn
+                ? "Connecting to network…"
+                : "Loading account…"}
+            </span>
+          </motion.div>
+        )}
+
+        {!isReady && !showSpinner && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            className="flex items-center justify-center gap-2 mb-4"
+          >
+            <Button
+              data-ocid="auth.primary_button"
+              onClick={() => {
+                setIiRequested(false);
+                iiLogin();
+              }}
+              className="text-sm font-semibold btn-glow"
+              style={{
+                background:
+                  "linear-gradient(135deg, oklch(0.62 0.18 210), oklch(0.52 0.22 280))",
+                color: "white",
+                border: "none",
+              }}
+            >
+              <ShieldCheck className="h-4 w-4 mr-2" />
+              Connect to Network
+            </Button>
+          </motion.div>
+        )}
 
         {/* Card */}
         <div
@@ -242,27 +323,6 @@ export function AuthScreen({ onSuccess }: AuthScreenProps) {
 
                   <div className="space-y-1.5">
                     <Label
-                      htmlFor="reg-height"
-                      className="text-xs font-medium text-muted-foreground uppercase tracking-wider"
-                    >
-                      Height (cm)
-                    </Label>
-                    <Input
-                      id="reg-height"
-                      data-ocid="auth.input"
-                      type="number"
-                      min={140}
-                      max={220}
-                      value={regHeight}
-                      onChange={(e) => setRegHeight(e.target.value)}
-                      placeholder="170"
-                      required
-                      className="bg-input/50 border-border/60"
-                    />
-                  </div>
-
-                  <div className="space-y-1.5">
-                    <Label
                       htmlFor="reg-city"
                       className="text-xs font-medium text-muted-foreground uppercase tracking-wider"
                     >
@@ -315,7 +375,7 @@ export function AuthScreen({ onSuccess }: AuthScreenProps) {
                 <Button
                   type="submit"
                   data-ocid="auth.submit_button"
-                  disabled={regLoading}
+                  disabled={regLoading || !isReady}
                   className="w-full btn-glow font-semibold"
                   style={{
                     background:
@@ -327,7 +387,7 @@ export function AuthScreen({ onSuccess }: AuthScreenProps) {
                   {regLoading ? (
                     <Loader2 className="h-4 w-4 animate-spin mr-2" />
                   ) : null}
-                  Create Account
+                  {!isReady ? "Connecting…" : "Create Account"}
                 </Button>
               </form>
             </TabsContent>
@@ -391,7 +451,7 @@ export function AuthScreen({ onSuccess }: AuthScreenProps) {
                 <Button
                   type="submit"
                   data-ocid="auth.submit_button"
-                  disabled={loginLoading}
+                  disabled={loginLoading || !isReady}
                   className="w-full btn-glow font-semibold"
                   style={{
                     background:
@@ -403,7 +463,7 @@ export function AuthScreen({ onSuccess }: AuthScreenProps) {
                   {loginLoading ? (
                     <Loader2 className="h-4 w-4 animate-spin mr-2" />
                   ) : null}
-                  Login
+                  {!isReady ? "Connecting…" : "Login"}
                 </Button>
               </form>
             </TabsContent>

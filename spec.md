@@ -1,38 +1,61 @@
-# Chatter
+# TalkZy
 
 ## Current State
-The app currently uses Internet Identity (II) for authentication and has a simple messaging system with username registration. It has a basic backend with user profiles, message sending, and conversation listing.
+The old backend is a basic messaging system with Internet Identity login and simple user profiles. It does not have username/password auth, gender-based matching, stranger chat, recharge, or disconnect approval. The frontend had repeated build failures.
 
 ## Requested Changes (Diff)
 
 ### Add
-- Custom username/password authentication (no Internet Identity)
-- Registration form: unique username, password, gender (male/female), age, height, city, occupation
-- Login form: username + password
-- "Recharge Account" feature: fixed amount of 100 with a "Pay Now" button leading to a payment gateway page (UI only, no real payment processor)
-- "New Chat" button: connects the logged-in user to another actively online user of the opposite gender (male connects to female, female connects to male)
-- Active session tracking: mark users as online/offline
-- Chat screen: text messages, image uploads, emoji/sticker picker, voice messages (audio recording)
-- Disconnect flow: user can only disconnect with the other user's approval (both must agree to end)
-- Logout option
-- No friend/contact lists, no blocking
+- Username/password based registration and login (no Internet Identity)
+- User profile fields: username, password (hashed), gender, age, city, occupation
+- Account balance/recharge system: recharge with 100 units, pay button
+- Stranger chat matching: male connects only to female, female connects only to male
+- Two match options from home: "Chat with Female" and "Chat with Male" (gender-specific)
+- Active user tracking: users register heartbeat to appear online
+- Match queue: users enter a waiting queue by desired gender, backend pairs them
+- Chat session: text messages, image sharing, emoji/sticker, voice messages
+- Disconnect with approval: one user requests disconnect, other must approve
+- Logout
+- 59-second matching timeout
 
 ### Modify
-- Replace II-based auth with custom username/password auth stored in backend
-- Replace old UserProfile with extended profile including gender, age, height, city, occupation
-- Update message sending to work within active paired sessions only
+- Remove old Internet Identity login flow entirely
+- Remove height field from registration
 
 ### Remove
-- Internet Identity / authorization component usage
-- Old simple username-only registration
-- Conversation list / contacts view (users don't add friends)
+- Friends/contacts system
+- Block system
+- Conversation history (chats are ephemeral stranger sessions)
 
 ## Implementation Plan
-1. Backend: store users with hashed passwords, extended profile fields, active sessions, pairing logic, disconnect-approval flow
-2. Backend: APIs for register, login, logout, set online status, find match (opposite gender), send message (text/image blob/audio blob), request disconnect, approve disconnect
-3. Frontend: Auth screen with register/login tabs
-4. Frontend: Home screen (post-login) with Recharge and New Chat buttons
-5. Frontend: Recharge page with amount 100 and Pay Now button (mock payment gateway page)
-6. Frontend: Matchmaking loading screen while finding a partner
-7. Frontend: Chat screen with text input, image upload, emoji/sticker panel, voice message recorder, disconnect request flow
-8. Frontend: Logout button
+
+### Backend (Motoko)
+1. User store: Map<Text, UserRecord> keyed by username
+   - UserRecord: { passwordHash: Text, gender: Text, age: Nat, city: Text, occupation: Text, balance: Nat, principalId: Principal }
+2. Session store: Map<Principal, SessionInfo> for login sessions
+3. Online presence: Map<Principal, Time> heartbeat timestamps
+4. Match queue: separate queues for users seeking male vs female
+5. Active chats: Map<Text, ChatSession> where chatId = sorted pair of usernames
+   - ChatSession: { user1: Principal, user2: Principal, messages: [ChatMessage], disconnectRequestedBy: ?Principal }
+6. Functions:
+   - register(username, password, gender, age, city, occupation) -> Result
+   - login(username, password) -> Result with sessionToken
+   - getMyProfile() -> UserProfile
+   - rechargeAccount() -> new balance (adds 100)
+   - heartbeat() -> () -- call every 10s to stay online
+   - findMatch(desiredGender: Text) -> MatchResult (queues user, returns chatId if matched)
+   - getActiveChatMessages(chatId) -> [ChatMessage]
+   - sendChatMessage(chatId, content: MessageContent) -> Result
+   - requestDisconnect(chatId) -> Result
+   - approveDisconnect(chatId) -> Result
+   - getChatSession(chatId) -> ?ChatSession
+   - pollForMatch(desiredGender) -> ?Text (returns chatId when matched)
+
+### Frontend
+1. AuthScreen: Login form (username + password) + Register form (username, password, gender, age, city, occupation)
+2. HomeScreen: Welcome, balance, "Chat with Female" button, "Chat with Male" button, Recharge button, Logout
+3. RechargeScreen: Show balance, "Recharge 100" button, "Pay Now" -> PaymentScreen
+4. PaymentScreen: Mock payment gateway with amount and pay button
+5. FindingScreen: Spinner, "Finding match..." text, 59-second countdown timeout
+6. ChatScreen: Message bubbles, image upload, emoji/sticker picker, voice record button, disconnect button
+7. DisconnectModal: "User wants to disconnect. Approve?" with approve/deny buttons

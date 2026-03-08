@@ -1,5 +1,5 @@
 import { Button } from "@/components/ui/button";
-import { useChatterStore } from "@/hooks/useChatterStore";
+import { getStoredBalance, getStoredSession } from "@/hooks/useChatterStore";
 import { ArrowLeft, Wallet, Zap } from "lucide-react";
 import { motion } from "motion/react";
 
@@ -10,8 +10,8 @@ interface RechargeScreenProps {
 }
 
 export function RechargeScreen({ onNavigate }: RechargeScreenProps) {
-  const { getBalance } = useChatterStore();
-  const balance = getBalance();
+  const session = getStoredSession();
+  const balance = getStoredBalance(session?.username ?? "");
 
   return (
     <div className="min-h-screen flex flex-col relative overflow-hidden">
