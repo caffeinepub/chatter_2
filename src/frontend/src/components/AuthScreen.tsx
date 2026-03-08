@@ -12,14 +12,16 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useActor } from "@/hooks/useActor";
 import { type Gender, useChatterStore } from "@/hooks/useChatterStore";
 import { useInternetIdentity } from "@/hooks/useInternetIdentity";
-import { Loader2, MessageCircleHeart, ShieldCheck } from "lucide-react";
+import { Loader2, MessageCircleHeart } from "lucide-react";
 import { motion } from "motion/react";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
 interface AuthScreenProps {
   onSuccess: () => void;
 }
+
+type PendingAction = "register" | "login" | null;
 
 export function AuthScreen({ onSuccess }: AuthScreenProps) {
   const { setupProfile, login } = useChatterStore();
@@ -30,7 +32,7 @@ export function AuthScreen({ onSuccess }: AuthScreenProps) {
     isLoggingIn,
     loginStatus,
   } = useInternetIdentity();
-  const { actor, isFetching: actorFetching } = useActor();
+  const { actor } = useActor();
 
   // Register form state
   const [regUsername, setRegUsername] = useState("");
@@ -48,40 +50,46 @@ export function AuthScreen({ onSuccess }: AuthScreenProps) {
   const [loginError, setLoginError] = useState("");
   const [loginLoading, setLoginLoading] = useState(false);
 
-  // Auto-trigger II login when page loads if not already authenticated
-  const [iiRequested, setIiRequested] = useState(false);
+  // Track if we're waiting for II to complete before proceeding
+  const pendingActionRef = useRef<PendingAction>(null);
+  const [waitingForII, setWaitingForII] = useState(false);
 
+  // When II login completes (identity becomes available), proceed with the pending action
   useEffect(() => {
-    if (
-      !isInitializing &&
-      !identity &&
-      !iiRequested &&
-      loginStatus === "idle"
-    ) {
-      setIiRequested(true);
-      iiLogin();
+    if (!identity || !pendingActionRef.current || !waitingForII) return;
+
+    const action = pendingActionRef.current;
+    pendingActionRef.current = null;
+    setWaitingForII(false);
+
+    if (action === "register") {
+      performRegister();
+    } else if (action === "login") {
+      performLogin();
     }
-  }, [isInitializing, identity, iiRequested, loginStatus, iiLogin]);
+    // performRegister/performLogin are stable refs — called after identity resolves
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [identity, waitingForII]);
 
-  const isReady = !!identity && !!actor && !actorFetching;
-  const showSpinner =
-    isInitializing ||
-    isLoggingIn ||
-    actorFetching ||
-    (!!identity && actorFetching);
+  // Watch for II login errors while waiting
+  useEffect(() => {
+    if (!waitingForII) return;
+    if (loginStatus === "loginError") {
+      setWaitingForII(false);
+      pendingActionRef.current = null;
+      setRegLoading(false);
+      setLoginLoading(false);
+      setRegError("Secure session setup failed. Please try again.");
+      setLoginError("Secure session setup failed. Please try again.");
+    }
+  }, [loginStatus, waitingForII]);
 
-  const handleRegister = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setRegError("");
+  const performRegister = useCallback(async () => {
     if (!regGender) {
       setRegError("Please select your gender.");
+      setRegLoading(false);
       return;
     }
-    if (!isReady) {
-      setRegError("Still connecting to network. Please wait a moment.");
-      return;
-    }
-    setRegLoading(true);
     const result = await setupProfile(
       regUsername,
       regGender as Gender,
@@ -97,16 +105,18 @@ export function AuthScreen({ onSuccess }: AuthScreenProps) {
     }
     toast.success("Account created! Welcome to TalkZy 💬");
     onSuccess();
-  };
+  }, [
+    regUsername,
+    regPassword,
+    regGender,
+    regAge,
+    regCity,
+    regOccupation,
+    setupProfile,
+    onSuccess,
+  ]);
 
-  const handleLogin = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setLoginError("");
-    if (!isReady) {
-      setLoginError("Still connecting to network. Please wait a moment.");
-      return;
-    }
-    setLoginLoading(true);
+  const performLogin = useCallback(async () => {
     const result = await login(loginUsername, loginPassword);
     setLoginLoading(false);
     if (!result.ok) {
@@ -115,6 +125,54 @@ export function AuthScreen({ onSuccess }: AuthScreenProps) {
     }
     toast.success("Welcome back!");
     onSuccess();
+  }, [loginUsername, loginPassword, login, onSuccess]);
+
+  const handleRegister = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setRegError("");
+
+    if (!regGender) {
+      setRegError("Please select your gender.");
+      return;
+    }
+    if (!actor) {
+      setRegError("Still connecting to network. Please wait a moment.");
+      return;
+    }
+
+    setRegLoading(true);
+
+    if (identity) {
+      // Already have an identity — proceed directly
+      await performRegister();
+    } else {
+      // Trigger II once; continue after identity resolves via useEffect
+      pendingActionRef.current = "register";
+      setWaitingForII(true);
+      iiLogin();
+    }
+  };
+
+  const handleLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoginError("");
+
+    if (!actor) {
+      setLoginError("Still connecting to network. Please wait a moment.");
+      return;
+    }
+
+    setLoginLoading(true);
+
+    if (identity) {
+      // Already have an identity — proceed directly
+      await performLogin();
+    } else {
+      // Trigger II once; continue after identity resolves via useEffect
+      pendingActionRef.current = "login";
+      setWaitingForII(true);
+      iiLogin();
+    }
   };
 
   return (
@@ -164,48 +222,22 @@ export function AuthScreen({ onSuccess }: AuthScreenProps) {
           </p>
         </div>
 
-        {/* Network status indicator */}
-        {showSpinner && (
+        {/* Subtle status hint — only shown when waiting for II session or initializing */}
+        {(isInitializing || waitingForII || isLoggingIn) && (
           <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             className="flex items-center justify-center gap-2 mb-4"
           >
             <Loader2
-              className="h-4 w-4 animate-spin"
-              style={{ color: "oklch(0.72 0.15 195)" }}
+              className="h-3.5 w-3.5 animate-spin"
+              style={{ color: "oklch(0.55 0.06 255)" }}
             />
-            <span className="text-xs" style={{ color: "oklch(0.6 0.04 255)" }}>
-              {isInitializing || isLoggingIn
-                ? "Connecting to network…"
-                : "Loading account…"}
+            <span className="text-xs" style={{ color: "oklch(0.5 0.03 255)" }}>
+              {waitingForII || isLoggingIn
+                ? "Setting up secure session…"
+                : "Initializing…"}
             </span>
-          </motion.div>
-        )}
-
-        {!isReady && !showSpinner && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            className="flex items-center justify-center gap-2 mb-4"
-          >
-            <Button
-              data-ocid="auth.primary_button"
-              onClick={() => {
-                setIiRequested(false);
-                iiLogin();
-              }}
-              className="text-sm font-semibold btn-glow"
-              style={{
-                background:
-                  "linear-gradient(135deg, oklch(0.62 0.18 210), oklch(0.52 0.22 280))",
-                color: "white",
-                border: "none",
-              }}
-            >
-              <ShieldCheck className="h-4 w-4 mr-2" />
-              Connect to Network
-            </Button>
           </motion.div>
         )}
 
@@ -375,7 +407,7 @@ export function AuthScreen({ onSuccess }: AuthScreenProps) {
                 <Button
                   type="submit"
                   data-ocid="auth.submit_button"
-                  disabled={regLoading || !isReady}
+                  disabled={regLoading || waitingForII}
                   className="w-full btn-glow font-semibold"
                   style={{
                     background:
@@ -384,10 +416,15 @@ export function AuthScreen({ onSuccess }: AuthScreenProps) {
                     border: "none",
                   }}
                 >
-                  {regLoading ? (
+                  {(regLoading || waitingForII) &&
+                  pendingActionRef.current === "register" ? (
                     <Loader2 className="h-4 w-4 animate-spin mr-2" />
                   ) : null}
-                  {!isReady ? "Connecting…" : "Create Account"}
+                  {waitingForII && pendingActionRef.current === "register"
+                    ? "Setting up…"
+                    : regLoading
+                      ? "Creating account…"
+                      : "Create Account"}
                 </Button>
               </form>
             </TabsContent>
@@ -451,7 +488,7 @@ export function AuthScreen({ onSuccess }: AuthScreenProps) {
                 <Button
                   type="submit"
                   data-ocid="auth.submit_button"
-                  disabled={loginLoading || !isReady}
+                  disabled={loginLoading || waitingForII}
                   className="w-full btn-glow font-semibold"
                   style={{
                     background:
@@ -460,10 +497,15 @@ export function AuthScreen({ onSuccess }: AuthScreenProps) {
                     border: "none",
                   }}
                 >
-                  {loginLoading ? (
+                  {(loginLoading || waitingForII) &&
+                  pendingActionRef.current === "login" ? (
                     <Loader2 className="h-4 w-4 animate-spin mr-2" />
                   ) : null}
-                  {!isReady ? "Connecting…" : "Login"}
+                  {waitingForII && pendingActionRef.current === "login"
+                    ? "Setting up…"
+                    : loginLoading
+                      ? "Logging in…"
+                      : "Login"}
                 </Button>
               </form>
             </TabsContent>

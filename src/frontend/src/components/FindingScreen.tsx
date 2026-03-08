@@ -3,13 +3,11 @@ import { useActor } from "@/hooks/useActor";
 import {
   type Gender,
   getStoredSession,
-  parseProfile,
   useChatterStore,
 } from "@/hooks/useChatterStore";
 import { ArrowLeft } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { toast } from "sonner";
 
 type Screen = "auth" | "home" | "recharge" | "payment" | "finding" | "chat";
 
@@ -23,7 +21,7 @@ interface FindingScreenProps {
 }
 
 const TIMEOUT_SECS = 59;
-const POLL_INTERVAL = 2500;
+const POLL_INTERVAL = 3000;
 
 export function FindingScreen({
   onNavigate,

@@ -1,61 +1,39 @@
 # TalkZy
 
 ## Current State
-The old backend is a basic messaging system with Internet Identity login and simple user profiles. It does not have username/password auth, gender-based matching, stranger chat, recharge, or disconnect approval. The frontend had repeated build failures.
+TalkZy is a stranger chat app with username/password auth, gender-based matching, text/image/emoji/voice messages, and a recharge flow. The backend uses the `authorization` component (role-based access control with Internet Identity principals). The frontend uses `useInternetIdentity` hook and auto-triggers an Internet Identity popup on page load. The `useActor` hook calls `_initializeAccessControlWithSecret` which requires the authorization component. Chat screens use `identity.getPrincipal()` to identify the current user.
 
 ## Requested Changes (Diff)
 
 ### Add
-- Username/password based registration and login (no Internet Identity)
-- User profile fields: username, password (hashed), gender, age, city, occupation
-- Account balance/recharge system: recharge with 100 units, pay button
-- Stranger chat matching: male connects only to female, female connects only to male
-- Two match options from home: "Chat with Female" and "Chat with Male" (gender-specific)
-- Active user tracking: users register heartbeat to appear online
-- Match queue: users enter a waiting queue by desired gender, backend pairs them
-- Chat session: text messages, image sharing, emoji/sticker, voice messages
-- Disconnect with approval: one user requests disconnect, other must approve
-- Logout
-- 59-second matching timeout
+- Simple anonymous actor creation (no II, no identity dependency)
+- Session-based "my principal" tracking using a fake/derived identifier stored in localStorage at login time
+- Backend user identity tied to a session token rather than II principal
 
 ### Modify
-- Remove old Internet Identity login flow entirely
-- Remove height field from registration
+- Backend: Remove `authorization` component entirely. Remove all `AccessControl` calls. Remove `MixinAuthorization`. Remove auth guards from all functions. Keep all user/chat/matching logic.
+- `useActor.ts`: Remove `useInternetIdentity` dependency. Always create an anonymous actor. Remove `_initializeAccessControlWithSecret` call.
+- `useChatterStore.ts`: Remove `useInternetIdentity` dependency. Remove `identity` usage. The "current principal" should be read from the stored session (the principalText stored at registration/login time — which will now be a generated anonymous principal from the canister).
+- `AuthScreen.tsx`: Remove all II-related code. Remove the `useInternetIdentity` import. Remove the auto-trigger `useEffect` that calls `iiLogin()`. Remove the "Connect to Network" button. The form should just show immediately — no spinner waiting for II.
+- `App.tsx`: Remove `useInternetIdentity`. Remove II-gating logic. On mount, just check localStorage session and backend profile.
+- `ChatScreen.tsx`: Get `myPrincipalText` from stored session instead of `identity`.
+- `HomeScreen.tsx`, `FindingScreen.tsx`: No II dependency changes needed (they already use session/actor).
+- `caffeine.lock.json`: Remove `authorization` component.
+- Backend: All functions become open (no permission checks). `registerUser`, `saveCallerUserProfile`, `getCallerUserProfile`, `getAllUsers`, `sendMessage`, `getConversation` all work without auth guards.
 
 ### Remove
-- Friends/contacts system
-- Block system
-- Conversation history (chats are ephemeral stranger sessions)
+- `useInternetIdentity` hook usage from all components
+- `authorization` Caffeine component
+- All `AccessControl` and `MixinAuthorization` imports from backend
+- The auto-II-login effect in `AuthScreen`
+- The `_initializeAccessControlWithSecret` call in `useActor`
 
 ## Implementation Plan
-
-### Backend (Motoko)
-1. User store: Map<Text, UserRecord> keyed by username
-   - UserRecord: { passwordHash: Text, gender: Text, age: Nat, city: Text, occupation: Text, balance: Nat, principalId: Principal }
-2. Session store: Map<Principal, SessionInfo> for login sessions
-3. Online presence: Map<Principal, Time> heartbeat timestamps
-4. Match queue: separate queues for users seeking male vs female
-5. Active chats: Map<Text, ChatSession> where chatId = sorted pair of usernames
-   - ChatSession: { user1: Principal, user2: Principal, messages: [ChatMessage], disconnectRequestedBy: ?Principal }
-6. Functions:
-   - register(username, password, gender, age, city, occupation) -> Result
-   - login(username, password) -> Result with sessionToken
-   - getMyProfile() -> UserProfile
-   - rechargeAccount() -> new balance (adds 100)
-   - heartbeat() -> () -- call every 10s to stay online
-   - findMatch(desiredGender: Text) -> MatchResult (queues user, returns chatId if matched)
-   - getActiveChatMessages(chatId) -> [ChatMessage]
-   - sendChatMessage(chatId, content: MessageContent) -> Result
-   - requestDisconnect(chatId) -> Result
-   - approveDisconnect(chatId) -> Result
-   - getChatSession(chatId) -> ?ChatSession
-   - pollForMatch(desiredGender) -> ?Text (returns chatId when matched)
-
-### Frontend
-1. AuthScreen: Login form (username + password) + Register form (username, password, gender, age, city, occupation)
-2. HomeScreen: Welcome, balance, "Chat with Female" button, "Chat with Male" button, Recharge button, Logout
-3. RechargeScreen: Show balance, "Recharge 100" button, "Pay Now" -> PaymentScreen
-4. PaymentScreen: Mock payment gateway with amount and pay button
-5. FindingScreen: Spinner, "Finding match..." text, 59-second countdown timeout
-6. ChatScreen: Message bubbles, image upload, emoji/sticker picker, voice record button, disconnect button
-7. DisconnectModal: "User wants to disconnect. Approve?" with approve/deny buttons
+1. Rewrite `backend/main.mo` — remove authorization imports/mixin, remove all AccessControl guards, keep all data structures and functions
+2. Remove `authorization` from `caffeine.lock.json`
+3. Rewrite `useActor.ts` — always use anonymous actor, no II
+4. Rewrite `useChatterStore.ts` — remove `useInternetIdentity`, get myPrincipal from stored session
+5. Rewrite `AuthScreen.tsx` — remove II auto-trigger, show forms immediately
+6. Rewrite `App.tsx` — remove II gating
+7. Rewrite `ChatScreen.tsx` — get myPrincipalText from stored session
+8. Regenerate backend and validate frontend build

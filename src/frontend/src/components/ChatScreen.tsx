@@ -1,7 +1,7 @@
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { useChatterStore } from "@/hooks/useChatterStore";
+import { getStoredSession, useChatterStore } from "@/hooks/useChatterStore";
 import { useInternetIdentity } from "@/hooks/useInternetIdentity";
 import { Image, Loader2, Mic, PhoneOff, Send, Smile, X } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
@@ -224,7 +224,10 @@ export function ChatScreen({
   } = useChatterStore();
 
   const { identity } = useInternetIdentity();
-  const myPrincipalText = identity?.getPrincipal().toText() ?? "";
+  const session = getStoredSession();
+  // Use identity if available; fall back to stored session principal
+  const myPrincipalText =
+    identity?.getPrincipal().toText() ?? session?.principalText ?? "";
 
   const [messages, setMessages] = useState<ParsedMessage[]>([]);
   const [text, setText] = useState("");

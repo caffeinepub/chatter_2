@@ -2,7 +2,6 @@ import { Toaster } from "@/components/ui/sonner";
 import { useActor } from "@/hooks/useActor";
 import type { Gender } from "@/hooks/useChatterStore";
 import { getStoredSession } from "@/hooks/useChatterStore";
-import { useInternetIdentity } from "@/hooks/useInternetIdentity";
 import { Loader2, MessageCircleHeart } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 import { useEffect, useState } from "react";
@@ -22,7 +21,6 @@ interface ChatContext {
 }
 
 export default function App() {
-  const { identity, isInitializing } = useInternetIdentity();
   const { actor, isFetching: actorFetching } = useActor();
 
   const [screen, setScreen] = useState<Screen>("auth");
@@ -32,26 +30,29 @@ export default function App() {
   const [appReady, setAppReady] = useState(false);
 
   // Check if user is already logged in on mount
+  // We no longer gate on isInitializing — show auth immediately and let
+  // the II session restore silently. If a stored session exists, we try
+  // to verify it via the actor (non-blocking: show auth if actor not yet ready).
   useEffect(() => {
-    if (isInitializing || actorFetching) return;
+    if (actorFetching) return;
 
     const session = getStoredSession();
-    if (!session || !identity || !actor) {
+
+    if (!session) {
+      // No stored session → go straight to auth
       setAppReady(true);
       setScreen("auth");
       return;
     }
 
-    // Verify the session principal matches the current II identity
-    const currentPrincipal = identity.getPrincipal().toText();
-    if (session.principalText !== currentPrincipal) {
-      // Different device or cleared II — show auth
+    if (!actor) {
+      // Actor not ready yet — show auth screen; user can still log in
       setAppReady(true);
       setScreen("auth");
       return;
     }
 
-    // Verify backend profile exists
+    // Try to verify the backend profile
     actor
       .getCallerUserProfile()
       .then((profile) => {
@@ -68,10 +69,11 @@ export default function App() {
         setAppReady(true);
       })
       .catch(() => {
+        // Backend unreachable — still let them see auth screen
         setAppReady(true);
         setScreen("auth");
       });
-  }, [isInitializing, actorFetching, identity, actor]);
+  }, [actorFetching, actor]);
 
   const handleNavigate = (nextScreen: Screen) => {
     setScreen(nextScreen);
@@ -94,8 +96,8 @@ export default function App() {
     setScreen("home");
   };
 
-  // Show loading while app initializes
-  if (!appReady || isInitializing) {
+  // Show a brief loading screen only while the actor is initializing
+  if (!appReady) {
     return (
       <div className="min-h-screen flex flex-col items-center justify-center bg-background gap-4">
         <div

@@ -14,17 +14,22 @@ export interface ParsedProfile {
   city: string;
   occupation: string;
   principalText: string;
+  passwordHash?: string;
   seekingGender?: string;
   seekingTimestamp?: number;
   matchedWith?: string;
   matchedPrincipal?: string;
   matchedChatId?: string;
+  matchAcceptTimestamp?: number;
 }
 
 // ── Encode/decode profile ─────────────────────────────────────────────────────
 
 /**
- * Format: "displayName||gender||age||city||occupation||principalText[||SEEKING:desiredGender:principal:ts][||MATCHED:displayName:chatId:principal]"
+ * Format:
+ * "displayName||gender||age||city||occupation||principalText||PWD:passwordHash[||SEEKING:desiredGender:principal:ts][||MATCHED:displayName:chatId:theirPrincipal:acceptTs]"
+ *
+ * The 7th base field is PWD:hash (always present after registration).
  */
 export function encodeProfile(
   displayName: string,
@@ -33,10 +38,12 @@ export function encodeProfile(
   city: string,
   occupation: string,
   principalText: string,
+  passwordHash?: string,
   extra?: string,
 ): string {
   const base = `${displayName}||${gender}||${age}||${city}||${occupation}||${principalText}`;
-  return extra ? `${base}||${extra}` : base;
+  const withPwd = passwordHash ? `${base}||PWD:${passwordHash}` : base;
+  return extra ? `${withPwd}||${extra}` : withPwd;
 }
 
 export function parseProfile(username: string): ParsedProfile | null {
@@ -74,24 +81,37 @@ export function parseProfile(username: string): ParsedProfile | null {
 
   // Parse optional flags
   for (const flag of rest) {
-    if (flag.startsWith("SEEKING:")) {
+    if (flag.startsWith("PWD:")) {
+      result.passwordHash = flag.slice(4);
+    } else if (flag.startsWith("SEEKING:")) {
       // SEEKING:desiredGender:myPrincipal:timestamp
       const [, desiredGender, , tsStr] = flag.split(":");
       result.seekingGender = desiredGender;
       result.seekingTimestamp = Number.parseInt(tsStr, 10);
     } else if (flag.startsWith("MATCHED:")) {
-      // MATCHED:displayName:chatId:theirPrincipal
-      const [, matchedWith, matchedChatId, matchedPrincipal] = flag.split(":");
+      // MATCHED:displayName:chatId:theirPrincipal:acceptTimestamp
+      const [, matchedWith, matchedChatId, matchedPrincipal, acceptTsStr] =
+        flag.split(":");
       result.matchedWith = matchedWith;
       result.matchedChatId = matchedChatId;
       result.matchedPrincipal = matchedPrincipal;
+      if (acceptTsStr) {
+        result.matchAcceptTimestamp = Number.parseInt(acceptTsStr, 10);
+      }
     }
   }
 
   return result;
 }
 
-// ── Password helpers (localStorage per username) ──────────────────────────────
+// ── Password helpers ──────────────────────────────────────────────────────────
+
+/**
+ * Compute password hash — stored in both localStorage and backend profile.
+ */
+function computePasswordHash(username: string, password: string): string {
+  return btoa(`${username}:${password}`);
+}
 
 function getPasswordKey(username: string): string {
   return `talkzy_pwd_${username.toLowerCase()}`;
@@ -100,14 +120,14 @@ function getPasswordKey(username: string): string {
 export function storePassword(username: string, password: string): void {
   localStorage.setItem(
     getPasswordKey(username),
-    btoa(`${username}:${password}`),
+    computePasswordHash(username, password),
   );
 }
 
 export function verifyPassword(username: string, password: string): boolean {
   const stored = localStorage.getItem(getPasswordKey(username));
   if (!stored) return false;
-  return stored === btoa(`${username}:${password}`);
+  return stored === computePasswordHash(username, password);
 }
 
 export function hasStoredPassword(username: string): boolean {
@@ -160,7 +180,8 @@ export function clearSession(): void {
 
 // ── STALE threshold ───────────────────────────────────────────────────────────
 
-const STALE_MS = 120_000; // 2 min
+const STALE_MS = 180_000; // 3 min — generous to avoid false "stale" drops
+const MATCH_ACCEPT_STALE_MS = 30_000; // matched entries older than 30s should be ignored
 
 // ── Hook ──────────────────────────────────────────────────────────────────────
 
@@ -181,9 +202,8 @@ export function useChatterStore() {
     ): Promise<{ ok: boolean; error?: string }> => {
       if (!actor)
         return { ok: false, error: "Not connected to network. Please wait." };
-      if (!identity) return { ok: false, error: "Not authenticated." };
 
-      const principalText = identity.getPrincipal().toText();
+      const principalText = identity?.getPrincipal().toText() ?? "anonymous";
 
       // Validate
       const lowerName = displayName.toLowerCase().trim();
@@ -206,6 +226,9 @@ export function useChatterStore() {
       if (!occupation.trim())
         return { ok: false, error: "Occupation is required." };
 
+      // Compute password hash to embed in the profile
+      const passwordHash = computePasswordHash(lowerName, password);
+
       const encodedUsername = encodeProfile(
         lowerName,
         gender,
@@ -213,6 +236,7 @@ export function useChatterStore() {
         city.trim(),
         occupation.trim(),
         principalText,
+        passwordHash,
       );
 
       try {
@@ -232,7 +256,7 @@ export function useChatterStore() {
         return { ok: false, error: `Registration failed: ${msg}` };
       }
 
-      // Store password and session
+      // Store password locally and save session
       storePassword(lowerName, password);
       storeSession(lowerName, principalText);
 
@@ -249,76 +273,152 @@ export function useChatterStore() {
       password: string,
     ): Promise<{ ok: boolean; error?: string }> => {
       if (!actor) return { ok: false, error: "Not connected. Please wait." };
-      if (!identity) return { ok: false, error: "Not authenticated." };
 
       const lowerName = displayName.toLowerCase().trim();
+      const currentPrincipal = identity?.getPrincipal().toText() ?? "anonymous";
+      const expectedHash = computePasswordHash(lowerName, password);
 
-      // Verify password stored locally
-      if (!hasStoredPassword(lowerName)) {
-        // Maybe they registered on another device — check backend
-        // We'll do a best-effort lookup by checking getAllUsers
+      // ── Step 1: Try local password check first (fast path - same device) ──
+      if (hasStoredPassword(lowerName)) {
+        if (!verifyPassword(lowerName, password)) {
+          return { ok: false, error: "Incorrect password." };
+        }
+
+        // Check if current principal matches the backend profile
         try {
-          const allUsers = await actor.getAllUsers();
-          const match = allUsers.find((u) => {
-            const p = parseProfile(u.username);
-            return p?.displayName === lowerName;
-          });
-          if (!match) {
-            return {
-              ok: false,
-              error: "User not found. Please create an account first.",
-            };
+          const profile = await actor.getCallerUserProfile();
+          if (profile) {
+            const parsed = parseProfile(profile.username);
+            if (parsed && parsed.displayName === lowerName) {
+              // Same device - straightforward login
+              storeSession(lowerName, currentPrincipal);
+              return { ok: true };
+            }
           }
-          // User exists on-chain. We can't verify password without local storage.
-          // Allow them to re-link by checking if their current II principal matches
-          const parsed = parseProfile(match.username);
-          if (!parsed) return { ok: false, error: "Invalid profile data." };
-          const currentPrincipal = identity.getPrincipal().toText();
-          if (parsed.principalText !== currentPrincipal) {
-            return {
-              ok: false,
-              error:
-                "This account was registered from a different device. Please use your original device or create a new account.",
-            };
-          }
-          // Same principal — store password locally and allow login
-          storePassword(lowerName, password);
-          storeSession(lowerName, currentPrincipal);
-          return { ok: true };
         } catch {
-          return { ok: false, error: "User not found." };
+          // Backend unreachable - fall through to full login
         }
       }
 
-      if (!verifyPassword(lowerName, password)) {
-        return { ok: false, error: "Incorrect password." };
-      }
-
-      // Also verify they still have a valid backend profile
+      // ── Step 2: Cross-device login — find user by username in getAllUsers() ──
+      let allUsers: Array<{ username: string }> = [];
       try {
-        const profile = await actor.getCallerUserProfile();
-        if (!profile) {
-          return {
-            ok: false,
-            error: "Account not found on network. Please create a new account.",
-          };
-        }
-        const parsed = parseProfile(profile.username);
-        if (!parsed || parsed.displayName !== lowerName) {
-          return {
-            ok: false,
-            error: "Account mismatch. Please create a new account.",
-          };
-        }
-        const principalText = identity.getPrincipal().toText();
-        storeSession(lowerName, principalText);
-        return { ok: true };
+        allUsers = await actor.getAllUsers();
       } catch {
-        // If we can't reach backend, still allow login with local password
-        const principalText = identity.getPrincipal().toText();
-        storeSession(lowerName, principalText);
-        return { ok: true };
+        return { ok: false, error: "Could not reach network. Please retry." };
       }
+
+      // Find the user's profile by display name
+      const matchedUser = allUsers.find((u) => {
+        const p = parseProfile(u.username);
+        return p?.displayName === lowerName;
+      });
+
+      if (!matchedUser) {
+        return {
+          ok: false,
+          error: "User not found. Please create an account first.",
+        };
+      }
+
+      const parsedUser = parseProfile(matchedUser.username);
+      if (!parsedUser) {
+        return { ok: false, error: "Invalid profile data on network." };
+      }
+
+      // ── Step 3: Verify password against embedded hash in profile ──
+      if (parsedUser.passwordHash) {
+        // New-format profile with embedded hash
+        if (parsedUser.passwordHash !== expectedHash) {
+          return { ok: false, error: "Incorrect password." };
+        }
+      } else {
+        // Legacy profile without embedded hash — we can't verify from another device
+        // If local password exists we've already verified above; otherwise reject
+        if (!hasStoredPassword(lowerName)) {
+          return {
+            ok: false,
+            error:
+              "This account was created before password sync was available. Please log in from your original device once to enable cross-device login.",
+          };
+        }
+        // Local password verified above — allow the login
+      }
+
+      // ── Step 4: Principal mismatch (different device) — create new profile ──
+      if (parsedUser.principalText !== currentPrincipal) {
+        // Register a NEW backend profile for the current device's principal.
+        // The backend maps caller's principal -> profile, so registerUser() from
+        // this principal creates a fresh entry tied to the current II identity.
+        const newEncodedUsername = encodeProfile(
+          parsedUser.displayName,
+          parsedUser.gender,
+          parsedUser.age,
+          parsedUser.city,
+          parsedUser.occupation,
+          currentPrincipal, // current device's principal
+          expectedHash, // embed the password hash
+        );
+
+        try {
+          await actor.registerUser(newEncodedUsername);
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          // "Already registered" means this principal already has a profile —
+          // that's fine, it just means they logged in from this device before.
+          if (
+            !msg.toLowerCase().includes("already") &&
+            !msg.toLowerCase().includes("registered")
+          ) {
+            return { ok: false, error: `Login failed: ${msg}` };
+          }
+          // If already registered, update the profile to have the latest data
+          try {
+            const existingProfile = await actor.getCallerUserProfile();
+            if (existingProfile) {
+              const existingParsed = parseProfile(existingProfile.username);
+              // Only update if the profile doesn't already match this user
+              if (!existingParsed || existingParsed.displayName !== lowerName) {
+                await actor.saveCallerUserProfile({
+                  username: newEncodedUsername,
+                  createdAt: existingProfile.createdAt,
+                });
+              }
+            }
+          } catch {
+            // best effort — login still succeeds
+          }
+        }
+      } else {
+        // Same principal — if profile doesn't have password hash yet, upgrade it
+        if (!parsedUser.passwordHash) {
+          try {
+            const profile = await actor.getCallerUserProfile();
+            if (profile) {
+              const upgraded = encodeProfile(
+                parsedUser.displayName,
+                parsedUser.gender,
+                parsedUser.age,
+                parsedUser.city,
+                parsedUser.occupation,
+                currentPrincipal,
+                expectedHash,
+              );
+              await actor.saveCallerUserProfile({
+                username: upgraded,
+                createdAt: profile.createdAt,
+              });
+            }
+          } catch {
+            // best effort
+          }
+        }
+      }
+
+      // Store password locally and save session
+      storePassword(lowerName, password);
+      storeSession(lowerName, currentPrincipal);
+      return { ok: true };
     },
     [actor, identity],
   );
@@ -340,6 +440,7 @@ export function useChatterStore() {
               parsed.city,
               parsed.occupation,
               parsed.principalText,
+              parsed.passwordHash,
             );
             await actor.saveCallerUserProfile({
               username: clean,
@@ -377,6 +478,7 @@ export function useChatterStore() {
           parsed.city,
           parsed.occupation,
           parsed.principalText,
+          parsed.passwordHash,
           seekFlag,
         );
         await actor.saveCallerUserProfile({
@@ -407,6 +509,7 @@ export function useChatterStore() {
         parsed.city,
         parsed.occupation,
         parsed.principalText,
+        parsed.passwordHash,
       );
       await actor.saveCallerUserProfile({
         username: clean,
@@ -474,7 +577,8 @@ export function useChatterStore() {
           .sort()
           .join("_CHAT_");
 
-        const matchFlag = `MATCHED:${seeker.displayName}:${chatId}:${seeker.principalText}`;
+        const acceptTs = Date.now();
+        const matchFlag = `MATCHED:${seeker.displayName}:${chatId}:${seeker.principalText}:${acceptTs}`;
         const encoded = encodeProfile(
           parsed.displayName,
           parsed.gender,
@@ -482,6 +586,7 @@ export function useChatterStore() {
           parsed.city,
           parsed.occupation,
           myPrincipalText,
+          parsed.passwordHash,
           matchFlag,
         );
         await actor.saveCallerUserProfile({
@@ -498,7 +603,8 @@ export function useChatterStore() {
   );
 
   /**
-   * Poll to see if someone accepted our match request
+   * Poll to see if someone accepted our match request.
+   * Returns the chat ID and partner profile if found.
    */
   const pollForMatch = useCallback(
     async (
@@ -512,18 +618,18 @@ export function useChatterStore() {
         for (const u of allUsers) {
           const p = parseProfile(u.username);
           if (!p) continue;
+          // Someone has matched with us
           if (p.matchedWith !== myDisplayName) continue;
           if (!p.matchedChatId) continue;
-          if (!p.seekingTimestamp && p.matchedChatId) {
-            // Check it's recent enough
-            // matchedChatId doesn't have timestamp, rely on seeker's seeking timestamp
-            return { chatId: p.matchedChatId, partner: p };
+
+          // Verify the match accept timestamp is fresh (not a stale leftover)
+          if (p.matchAcceptTimestamp) {
+            if (now - p.matchAcceptTimestamp > MATCH_ACCEPT_STALE_MS) {
+              // This match was accepted long ago; might be stale — skip
+              continue;
+            }
           }
-          // Also accept if seeking timestamp is recent
-          if (p.seekingTimestamp && now - p.seekingTimestamp < STALE_MS) {
-            return { chatId: p.matchedChatId, partner: p };
-          }
-          // Just return it anyway — someone matched with us
+
           return { chatId: p.matchedChatId, partner: p };
         }
         return null;
